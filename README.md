@@ -8,6 +8,27 @@ vLLM-class: PagedAttention KV cache, continuous batching, tensor+pipeline parall
 ## MVP (1 weekend)
 Load Llama-3-8B, naive token-by-token generation, HTTP `/v1/completions` endpoint.
 
+## M2 Status — shipped
+
+Real per-sequence `KVCache` (wraps HF `past_key_values`) + server-side
+`StaticBatcher` (async queue, flushes on N queued OR T ms elapsed) that
+runs one padded forward pass per decode step across the batch.
+
+Throughput on MacBook CPU · `sshleifer/tiny-gpt2` · 32 new tokens, greedy:
+
+| Mode                                    | tok/s  | Speedup |
+| --------------------------------------- | ------ | ------- |
+| No KV cache (re-encode prefix each step)|  476.7 | 1.00x   |
+| KV cache, B=1                           | 1757.4 | 3.69x   |
+| Static batch, B=4                       | 1838.8 | 3.86x   |
+| Static batch, B=8                       | 3028.2 | 6.35x   |
+| Static batch, B=16                      | 6255.9 | 13.1x   |
+
+Reproduce: `cd mvp && source venv/bin/activate && python bench.py`.
+Numbers vary ±15% run-to-run on CPU. The server wires the batcher into
+`/v1/completions` so concurrent HTTP clients get merged into batches
+automatically (configurable via `MVP_MAX_BATCH`, `MVP_MAX_WAIT_MS`).
+
 ## MVP Status — shipped
 
 A working slice lives in [`mvp/`](./mvp/): FastAPI + PyTorch CPU,
@@ -38,7 +59,7 @@ details, and what's stubbed for later milestones.
 
 ## Milestones
 - **M1 (Week 1):** Single-GPU HF-transformers baseline + sampling (top-k/p/temp)
-- **M2 (Week 3):** Custom KV cache + batched generation
+- **M2 (Week 3):** Custom KV cache + batched generation  ✅ shipped (see "M2 Status" above)
 - **M3 (Week 6):** PagedAttention (Triton kernel) + continuous batching
 - **M4 (Week 9):** Speculative decoding + INT4 quantization (AWQ/GPTQ)
 - **M5 (Week 12):** Tensor-parallel multi-GPU + OpenAI-compatible API

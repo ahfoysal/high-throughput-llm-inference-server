@@ -6,6 +6,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException
 
+import os
+
+from .batcher import StaticBatcher
 from .engine import InferenceEngine
 from .schemas import (
     CompletionChoice,
@@ -23,16 +26,26 @@ logger = logging.getLogger("mvp")
 
 
 engine: InferenceEngine | None = None
+batcher: StaticBatcher | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global engine
+    global engine, batcher
     logger.info("Initializing InferenceEngine...")
     engine = InferenceEngine()
-    logger.info("Engine ready — backend=%s model=%s", engine.backend_name, engine.model_name)
+    max_batch = int(os.environ.get("MVP_MAX_BATCH", "8"))
+    max_wait_ms = int(os.environ.get("MVP_MAX_WAIT_MS", "20"))
+    batcher = StaticBatcher(engine, max_batch=max_batch, max_wait_ms=max_wait_ms)
+    batcher.start()
+    logger.info(
+        "Engine ready — backend=%s model=%s batch<=%d wait<=%dms",
+        engine.backend_name, engine.model_name, max_batch, max_wait_ms,
+    )
     yield
     logger.info("Shutting down.")
+    if batcher is not None:
+        await batcher.stop()
 
 
 app = FastAPI(
@@ -53,8 +66,8 @@ def health() -> HealthResponse:
 
 
 @app.post("/v1/completions", response_model=CompletionResponse)
-def completions(req: CompletionRequest) -> CompletionResponse:
-    if engine is None:
+async def completions(req: CompletionRequest) -> CompletionResponse:
+    if engine is None or batcher is None:
         raise HTTPException(status_code=503, detail="Engine not initialized")
 
     if req.stream:
@@ -63,13 +76,16 @@ def completions(req: CompletionRequest) -> CompletionResponse:
 
     if isinstance(req.prompt, list):
         if len(req.prompt) != 1:
-            # TODO(M3): batched prompts — handled by ContinuousBatcher.
-            raise HTTPException(status_code=400, detail="MVP supports a single prompt only")
+            # TODO(M3): batched prompts in one request. The batcher merges
+            # concurrent single-prompt requests into a batch server-side.
+            raise HTTPException(status_code=400, detail="MVP supports a single prompt per request")
         prompt = req.prompt[0]
     else:
         prompt = req.prompt
 
-    result = engine.generate(
+    # Submit through the static batcher — concurrent requests get merged
+    # into a single padded forward per decode step.
+    result = await batcher.submit(
         prompt=prompt,
         max_tokens=req.max_tokens,
         temperature=req.temperature,

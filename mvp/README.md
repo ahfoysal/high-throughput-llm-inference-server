@@ -14,7 +14,8 @@ mvp/
 └── app/
     ├── __init__.py
     ├── main.py      # FastAPI app, /v1/completions, /health
-    ├── engine.py    # InferenceEngine + KVCache / ContinuousBatcher placeholders
+    ├── engine.py    # InferenceEngine + KVCache + batched HF forward (M2)
+    ├── batcher.py   # StaticBatcher: async queue, size/time flush (M2)
     ├── sampling.py  # greedy / temperature / top-p / top-k
     └── schemas.py   # Pydantic OpenAI-compatible request/response models
 ```
@@ -53,6 +54,8 @@ curl -s http://127.0.0.1:8765/health
 | ------------ | ---------------------- | ---------------------------------------------------- |
 | `MVP_MODEL`  | `sshleifer/tiny-gpt2`  | HF model id to load                                  |
 | `MVP_MOCK`   | unset                  | If `1`/`true`, skip HF and use the mock backend      |
+| `MVP_MAX_BATCH`   | `8`               | Max requests fused into one batched forward pass     |
+| `MVP_MAX_WAIT_MS` | `20`              | Max ms to wait for more requests before flushing     |
 
 ### Mock fallback
 
@@ -82,12 +85,20 @@ Supported in MVP:
 - HF `past_key_values` KV-cache reuse (so each step decodes one token,
   not the full prefix)
 
+Shipped in M2:
+- Real `KVCache` — holds HF `past_key_values` across decode steps so
+  each step decodes 1 new token (prefix never re-encoded). ~3.7x vs
+  no-cache on CPU / tiny-gpt2.
+- `StaticBatcher` (`app/batcher.py`) — async queue; flushes on N
+  queued OR T ms elapsed; merges concurrent `/v1/completions` requests
+  into a single padded forward per decode step. ~5.5x at B=16 vs B=1
+  on CPU / tiny-gpt2. Configurable via `MVP_MAX_BATCH`/`MVP_MAX_WAIT_MS`.
+- `python bench.py` reproduces the numbers locally.
+
 Scaffolded, not implemented (see TODOs in code):
-- `KVCache` class — placeholder. **M2**: custom pre-allocated cache.
-  **M3**: block-level PagedAttention.
-- `ContinuousBatcher` — currently a global lock that serializes
-  requests. **M3**: true continuous batching (merge new requests into
-  an in-flight decode step).
+- **M3**: block-level PagedAttention for `KVCache`, true continuous
+  batching (merge new requests into an in-flight decode step instead
+  of static batching that waits for the batch to finish).
 - Streaming responses (SSE) — stubbed out with a 400.
 - Batched prompts (`prompt: [..., ...]`) — stubbed out with a 400.
 - `stop` sequences — accepted in schema, not enforced.
