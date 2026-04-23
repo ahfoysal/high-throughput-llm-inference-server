@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException
 
 import os
 
-from .batcher import StaticBatcher
+from .batcher import ContinuousBatcher
 from .engine import InferenceEngine
 from .schemas import (
     CompletionChoice,
@@ -26,7 +26,7 @@ logger = logging.getLogger("mvp")
 
 
 engine: InferenceEngine | None = None
-batcher: StaticBatcher | None = None
+batcher: ContinuousBatcher | None = None
 
 
 @asynccontextmanager
@@ -36,7 +36,7 @@ async def lifespan(app: FastAPI):
     engine = InferenceEngine()
     max_batch = int(os.environ.get("MVP_MAX_BATCH", "8"))
     max_wait_ms = int(os.environ.get("MVP_MAX_WAIT_MS", "20"))
-    batcher = StaticBatcher(engine, max_batch=max_batch, max_wait_ms=max_wait_ms)
+    batcher = ContinuousBatcher(engine, max_batch=max_batch, max_wait_ms=max_wait_ms)
     batcher.start()
     logger.info(
         "Engine ready — backend=%s model=%s batch<=%d wait<=%dms",
