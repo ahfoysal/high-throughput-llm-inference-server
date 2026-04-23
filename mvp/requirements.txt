@@ -1,0 +1,7 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+pydantic>=2.6
+torch>=2.2
+transformers>=4.40
+tokenizers>=0.19
+numpy>=1.26
