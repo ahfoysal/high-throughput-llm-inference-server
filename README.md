@@ -8,6 +8,101 @@ vLLM-class: PagedAttention KV cache, continuous batching, tensor+pipeline parall
 ## MVP (1 weekend)
 Load Llama-3-8B, naive token-by-token generation, HTTP `/v1/completions` endpoint.
 
+## M5 Status — shipped
+
+Pivoted from tensor-parallel multi-GPU (not possible on this Mac) to a
+**production-ready OpenAI-compatible API**. Additions in
+[`mvp/app/`](./mvp/app/):
+
+- **`/v1/chat/completions`** — OpenAI chat schema (messages array,
+  roles, `tools`). Non-chat-tuned backing model gets a minimal
+  ChatML-ish template applied in [`chat.py`](./mvp/app/chat.py).
+- **SSE streaming** — both completion endpoints accept `stream=true`
+  and emit `data: {...}\n\n` deltas terminated by `data: [DONE]`.
+- **Function / tool calling** — `tools` array goes into a system
+  preamble; generated text is sniffed for
+  `{"name": "...", "arguments": {...}}` objects and surfaced as
+  structured `tool_calls` on the response, matching OpenAI's shape.
+- **Bearer-token auth** — [`auth.py`](./mvp/app/auth.py). Set
+  `MVP_API_KEYS=key1,key2`; unset means auth is off (warned at
+  startup). `/health` and `/metrics` stay unauthenticated.
+- **Prometheus `/metrics`** — [`metrics.py`](./mvp/app/metrics.py).
+  Counters for requests / prompt-tokens / completion-tokens, latency
+  histogram, all labelled by model + endpoint. Zero extra
+  dependency — text format is emitted by hand.
+- **Multi-model routing** — `MVP_MODELS=a,b,c` loads N engines at
+  startup and dispatches by request `model` field. Short aliases
+  (`tiny-gpt2` → `sshleifer/tiny-gpt2`) resolve automatically.
+  Unknown models fall back to the first loaded model so existing
+  clients keep working.
+
+### Curl examples
+
+```bash
+export MVP_API_KEYS=dev-key
+export MVP_MODELS=sshleifer/tiny-gpt2
+uvicorn app.main:app --host 127.0.0.1 --port 8765
+```
+
+Chat completion:
+
+```bash
+curl -s http://127.0.0.1:8765/v1/chat/completions \
+  -H 'Authorization: Bearer dev-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model":"tiny-gpt2",
+    "messages":[{"role":"user","content":"Say hi"}],
+    "max_tokens":16,"seed":42
+  }'
+```
+
+Streaming:
+
+```bash
+curl -N http://127.0.0.1:8765/v1/chat/completions \
+  -H 'Authorization: Bearer dev-key' \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"tiny-gpt2","stream":true,
+       "messages":[{"role":"user","content":"stream me"}],
+       "max_tokens":16,"seed":1}'
+```
+
+Tool call:
+
+```bash
+curl -s http://127.0.0.1:8765/v1/chat/completions \
+  -H 'Authorization: Bearer dev-key' \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "model":"tiny-gpt2",
+    "messages":[{"role":"user","content":"What is the weather in Tokyo?"}],
+    "tools":[{"type":"function","function":{
+       "name":"get_weather",
+       "description":"Get weather by city",
+       "parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}],
+    "max_tokens":32
+  }'
+```
+
+Unauth returns 401:
+
+```bash
+curl -i http://127.0.0.1:8765/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '{"model":"tiny-gpt2","messages":[{"role":"user","content":"hi"}]}'
+# HTTP/1.1 401 Unauthorized
+```
+
+Metrics:
+
+```bash
+curl -s http://127.0.0.1:8765/metrics | head
+# # HELP llm_requests_total llm_requests_total
+# # TYPE llm_requests_total counter
+# llm_requests_total{endpoint="chat_completions",model="sshleifer/tiny-gpt2",status="ok"} 3
+```
+
 ## M3 Status — shipped
 
 Block-paged KV cache + continuous batching (vLLM-style iteration-level
@@ -110,7 +205,7 @@ details, and what's stubbed for later milestones.
 - **M2 (Week 3):** Custom KV cache + batched generation  ✅ shipped (see "M2 Status" above)
 - **M3 (Week 6):** PagedAttention + continuous batching  ✅ shipped (pure-PyTorch paged simulation, see "M3 Status" above)
 - **M4 (Week 9):** Speculative decoding + INT4 quantization (AWQ/GPTQ)
-- **M5 (Week 12):** Tensor-parallel multi-GPU + OpenAI-compatible API
+- **M5 (Week 12):** Production-ready OpenAI-compatible API (chat, SSE streaming, tool calling, auth, Prometheus metrics, multi-model routing) ✅ shipped — tensor-parallel multi-GPU deferred (no multi-GPU hardware available)
 
 ## Key References
 - vLLM paper (Kwon et al., 2023 — PagedAttention)
