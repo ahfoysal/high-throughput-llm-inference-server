@@ -8,6 +8,108 @@ vLLM-class: PagedAttention KV cache, continuous batching, tensor+pipeline parall
 ## MVP (1 weekend)
 Load Llama-3-8B, naive token-by-token generation, HTTP `/v1/completions` endpoint.
 
+## M6 Status — shipped
+
+Three independent pieces, all CPU-runnable on this Mac, all with
+self-tests (`python -m app.<module>`):
+
+### 1. LoRA adapter hot-swap — [`mvp/app/lora.py`](./mvp/app/lora.py)
+
+Low-rank adapters applied on top of a frozen base model, swappable
+per-request. Wrap any `nn.Linear` *or* GPT-2 `Conv1D` with
+`LoRALinear`; the manager keeps multiple `(A, B)` tensor pairs in RAM
+and `activate(name)` flips pointer references across every wrapped
+module — **no matmul at swap time**, just attribute assignment.
+
+- peft-compatible loader (`load_peft_dir`) parses
+  `base_model.model.*.lora_{A,B}.weight` out of
+  `adapter_model.safetensors` / `.bin` without requiring the `peft`
+  package itself.
+- Correctness: a zero-B adapter (LoRA-init convention) produces
+  **max |Δlogits| = 0.0** vs the base model; a random adapter
+  perturbs logits; `deactivate()` restores the baseline bit-exactly.
+
+Hot-swap overhead on CPU (`gpt2`, 48 wrapped linears, rank=8):
+
+| metric                 | value            |
+| ---------------------- | ---------------- |
+| swap latency           | **415 µs / swap** |
+| swap latency tiny-gpt2 | 68 µs / swap (8 targets) |
+
+That's ~O(10 µs / target) — negligible compared to a decode step.
+
+### 2. Real speculative decoding — [`mvp/app/speculative.py`](./mvp/app/speculative.py)
+
+Upgraded the M4 greedy-match decoder with proper **rejection sampling**
+(Leviathan et al. 2023): accept draft token `x` with probability
+`min(1, p(x)/q(x))`; on reject, resample from the residual
+`(p − q)_+ / Z`. Marginal distribution of emitted tokens is provably
+equal to the target's distribution — same quality as naive target
+sampling, fewer target forwards when draft agrees.
+
+New API: `SpeculativeDecoder.generate_rejection(prompt, max_tokens,
+temperature, top_k, seed)`. Baseline `sample_baseline(...)` added for
+wall-clock comparison.
+
+Run with real `distilgpt2` (draft) + `gpt2` (target) on CPU, K=4,
+48 new tokens, T=1.0, top_k=50:
+
+| path                             | tok/s | acceptance |
+| -------------------------------- | ----- | ---------- |
+| target-only multinomial baseline | 47.2  | –          |
+| greedy spec (argmax match)       | 25.2  | 39.2%      |
+| **rejection-sampling spec (M6)** | 17.8  | **24.0%**  |
+
+Acceptance is the expected ballpark for distilgpt2→gpt2. On CPU the
+target forward doesn't amortize across the proposed K because GPT-2
+prefill at length 5 ≈ the cost of 5 decode steps, so the target-only
+sampler wins wall-clock. On GPU with a larger target the
+arithmetic flips — acceptance × K ≈ net speedup. The correctness
+invariant (`draft == target` ⇒ byte-identical output) still holds for
+the greedy path as a regression gate.
+
+### 3. Paged-attention Triton kernel — [`mvp/app/paged_attention_triton.py`](./mvp/app/paged_attention_triton.py)
+
+Full Triton kernel written out (`paged_attention_kernel`) — one
+program per `(seq, head)`, walks the block table, online-softmax over
+BLOCK_SIZE tokens at a time. Guarded by an `_TRITON_AVAILABLE` check
+so it's only JIT-ed on a box with Triton + CUDA; on this Mac we route
+to a pure-PyTorch oracle (`paged_attention_cpu`) with an identical
+signature.
+
+The scheduling-logic validator (`_validate_block_scheduling`) builds
+mock batches (random context lens, block-table allocation from a
+shuffled free list, K/V filled with random tensors) and compares the
+CPU paged-attention output against a dense reference that gathers the
+logical sequence directly:
+
+```
+triton available: False
+cuda available:   False
+Running CPU fallback against dense reference on mock batches...
+  seed=0 max|err|=0.000e+00
+  seed=1 max|err|=0.000e+00
+  seed=2 max|err|=0.000e+00
+  seed=3 max|err|=0.000e+00
+  seed=4 max|err|=0.000e+00
+OK — scheduling logic (block tables, context lens) validates clean.
+```
+
+This is the scaffolding you need for the kernel itself to be drop-in
+testable — once we land on GPU hardware, we assert Triton output == CPU
+output on the same mock batches and ship.
+
+Reproduce M6 locally:
+
+```bash
+cd mvp && source venv/bin/activate
+python -m app.lora                         # LoRA self-test + hot-swap bench
+python -m app.paged_attention_triton       # paged-attn scheduling validator
+SPEC_TARGET=gpt2 SPEC_DRAFT=distilgpt2 \
+  SPEC_K=4 SPEC_TOKENS=48 SPEC_TEMP=1.0 SPEC_TOP_K=50 \
+  python -m app.speculative                # draft/target spec decoding + acceptance
+```
+
 ## M5 Status — shipped
 
 Pivoted from tensor-parallel multi-GPU (not possible on this Mac) to a
@@ -206,6 +308,7 @@ details, and what's stubbed for later milestones.
 - **M3 (Week 6):** PagedAttention + continuous batching  ✅ shipped (pure-PyTorch paged simulation, see "M3 Status" above)
 - **M4 (Week 9):** Speculative decoding + INT4 quantization (AWQ/GPTQ)
 - **M5 (Week 12):** Production-ready OpenAI-compatible API (chat, SSE streaming, tool calling, auth, Prometheus metrics, multi-model routing) ✅ shipped — tensor-parallel multi-GPU deferred (no multi-GPU hardware available)
+- **M6:** LoRA adapter hot-swap + real draft/target speculative decoding (rejection sampling) + Triton PagedAttention kernel (with CPU oracle for scheduler validation) ✅ shipped
 
 ## Key References
 - vLLM paper (Kwon et al., 2023 — PagedAttention)

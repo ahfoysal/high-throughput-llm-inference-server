@@ -1,4 +1,9 @@
-"""M4: Speculative decoding.
+"""M4 / M6: Speculative decoding.
+
+M6 upgrade: real draft/target pair (`distilgpt2` / `gpt2` by default)
+plus proper **rejection sampling** against the draft and target
+distributions — not just greedy argmax-matching. Also measures and
+reports acceptance rate.
 
 Two-model speculative decoding:
 
@@ -135,6 +140,210 @@ class SpeculativeDecoder:
                 out = self.target(input_ids=cur, past_key_values=past, use_cache=True)
                 past = out.past_key_values
                 nxt = int(out.logits[0, -1, :].argmax().item())
+                out_tokens.append(nxt)
+                cur = torch.tensor([[nxt]], dtype=ids.dtype)
+        return out_tokens, time.time() - t0
+
+    # ------------------------------------------------------------------
+    # Real speculative decoding with rejection sampling.
+    # ------------------------------------------------------------------
+    #
+    # This is the *Leviathan et al. 2023* / *Chen et al. 2023* procedure:
+    #
+    #   For each draft position i in 1..K:
+    #     Let q = draft prob over vocab at step i
+    #     Let p = target prob over vocab at step i
+    #     Draw u ~ Uniform(0,1)
+    #     If u < min(1, p(x_i) / q(x_i)):  accept x_i
+    #     Else: reject, resample from the residual distribution
+    #            p'(x) = max(0, p(x) - q(x)) / Σ max(0, p - q)
+    #           break out of the acceptance loop
+    #
+    # If ALL K draft tokens are accepted, we additionally sample one
+    # "free" bonus token from p_{K+1} (target's prediction after the
+    # last accepted draft token).
+    #
+    # This procedure gives output tokens whose marginal distribution is
+    # exactly p (the target's distribution), so it's a drop-in
+    # replacement for plain target sampling — same quality, fewer
+    # target forward passes when draft and target agree a lot.
+    # ------------------------------------------------------------------
+    def generate_rejection(
+        self,
+        prompt: str,
+        max_tokens: int,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        seed: Optional[int] = None,
+    ) -> SpecResult:
+        t0 = time.time()
+        if seed is not None:
+            torch.manual_seed(seed)
+
+        tau = max(float(temperature), 1e-6)
+
+        def _probs(logits: torch.Tensor) -> torch.Tensor:
+            """logits: (V,) -> probability vector (V,) after temp + optional top-k."""
+            z = logits / tau
+            if top_k is not None and top_k > 0 and top_k < z.shape[-1]:
+                vals, idx = torch.topk(z, top_k)
+                mask = torch.full_like(z, float("-inf"))
+                mask[idx] = vals
+                z = mask
+            return torch.softmax(z, dim=-1)
+
+        ids = self.tokenizer(prompt, return_tensors="pt").input_ids
+        prompt_len = int(ids.shape[1])
+
+        with torch.no_grad():
+            d_out = self.draft(input_ids=ids, use_cache=True)
+            t_out = self.target(input_ids=ids, use_cache=True)
+        draft_past = d_out.past_key_values
+        target_past = t_out.past_key_values
+        last_token = int(ids[0, -1].item())
+        draft_cached = prompt_len
+        target_cached = prompt_len
+
+        generated: List[int] = []
+        proposed = accepted = bonus = rounds = 0
+
+        with torch.no_grad():
+            while len(generated) < max_tokens:
+                rounds += 1
+                K = min(self.K, max_tokens - len(generated))
+
+                # ----- 1. Draft proposes K tokens + records q_i(x_i) -----
+                draft_tokens: List[int] = []
+                draft_probs_at_pos: List[torch.Tensor] = []
+                d_past = draft_past
+                d_cur = torch.tensor([[last_token]], dtype=ids.dtype)
+                for _ in range(K):
+                    d_step = self.draft(
+                        input_ids=d_cur, past_key_values=d_past, use_cache=True
+                    )
+                    d_past = d_step.past_key_values
+                    q = _probs(d_step.logits[0, -1, :])
+                    tok = int(torch.multinomial(q, 1).item())
+                    draft_tokens.append(tok)
+                    draft_probs_at_pos.append(q)
+                    d_cur = torch.tensor([[tok]], dtype=ids.dtype)
+                proposed += K
+
+                # ----- 2. Target forward over K+1 positions -----
+                verify_in = torch.tensor(
+                    [[last_token] + draft_tokens], dtype=ids.dtype
+                )
+                t_step = self.target(
+                    input_ids=verify_in,
+                    past_key_values=target_past,
+                    use_cache=True,
+                )
+                # logits[i] predicts token at draft position i (0..K-1)
+                # logits[K] is the bonus slot.
+                target_probs_at_pos: List[torch.Tensor] = [
+                    _probs(t_step.logits[0, i, :]) for i in range(K + 1)
+                ]
+
+                # ----- 3. Rejection loop -----
+                a = 0
+                corrective: Optional[int] = None
+                for i in range(K):
+                    q = draft_probs_at_pos[i]
+                    p = target_probs_at_pos[i]
+                    x = draft_tokens[i]
+                    qx = float(q[x])
+                    px = float(p[x])
+                    # min(1, p/q); guard q=0 (shouldn't happen post-softmax)
+                    ratio = 1.0 if qx <= 0 else min(1.0, px / qx)
+                    u = float(torch.rand(1).item())
+                    if u < ratio:
+                        a += 1
+                        continue
+                    # Rejected — sample from residual (p - q)+ normalized.
+                    residual = (p - q).clamp(min=0.0)
+                    s = float(residual.sum())
+                    if s > 0:
+                        residual = residual / s
+                        corrective = int(torch.multinomial(residual, 1).item())
+                    else:
+                        # Degenerate (p fully covered by q on top). Fall
+                        # back to target's own sample at this position.
+                        corrective = int(torch.multinomial(p, 1).item())
+                    break
+                accepted += a
+
+                if corrective is None:
+                    # All K accepted → bonus token from p_{K} (slot K).
+                    corrective = int(torch.multinomial(target_probs_at_pos[K], 1).item())
+                    bonus += 1
+                    kept = draft_tokens[:a] + [corrective]
+                else:
+                    kept = draft_tokens[:a] + [corrective]
+
+                # Truncate if overshooting budget
+                remaining = max_tokens - len(generated)
+                kept = kept[:remaining]
+                generated.extend(kept)
+
+                # ----- 4. KV cache fixup (same bookkeeping as greedy path) -----
+                target_cached = target_cached + len(kept)
+                target_past = _trim_past(t_step.past_key_values, target_cached)
+                draft_commit = draft_cached + max(0, len(kept) - 1)
+                draft_past = _trim_past(d_past, draft_commit)
+                draft_cached = draft_commit
+
+                last_token = kept[-1] if kept else last_token
+
+                if (
+                    self.tokenizer.eos_token_id is not None
+                    and last_token == self.tokenizer.eos_token_id
+                ):
+                    break
+
+        text = self.tokenizer.decode(generated, skip_special_tokens=True)
+        return SpecResult(
+            tokens=generated,
+            text=text,
+            rounds=rounds,
+            proposed=proposed,
+            accepted=accepted,
+            bonus=bonus,
+            wall_time=time.time() - t0,
+        )
+
+    # ------------------------------------------------------------------
+    # Baseline — plain multinomial sample from the target alone.
+    # Useful for apples-to-apples wall-clock comparison with the
+    # rejection-sampling path.
+    # ------------------------------------------------------------------
+    def sample_baseline(
+        self,
+        prompt: str,
+        max_tokens: int,
+        temperature: float = 1.0,
+        top_k: Optional[int] = None,
+        seed: Optional[int] = None,
+    ) -> Tuple[List[int], float]:
+        t0 = time.time()
+        if seed is not None:
+            torch.manual_seed(seed)
+        tau = max(float(temperature), 1e-6)
+        ids = self.tokenizer(prompt, return_tensors="pt").input_ids
+        past = None
+        cur = ids
+        out_tokens: List[int] = []
+        with torch.no_grad():
+            for _ in range(max_tokens):
+                out = self.target(input_ids=cur, past_key_values=past, use_cache=True)
+                past = out.past_key_values
+                z = out.logits[0, -1, :] / tau
+                if top_k is not None and top_k > 0 and top_k < z.shape[-1]:
+                    vals, idx = torch.topk(z, top_k)
+                    mask = torch.full_like(z, float("-inf"))
+                    mask[idx] = vals
+                    z = mask
+                p = torch.softmax(z, dim=-1)
+                nxt = int(torch.multinomial(p, 1).item())
                 out_tokens.append(nxt)
                 cur = torch.tensor([[nxt]], dtype=ids.dtype)
         return out_tokens, time.time() - t0
@@ -303,6 +512,27 @@ def _main() -> None:
         assert match, "speculative output diverged from greedy baseline!"
 
     print(f"  text: {res.text!r}")
+
+    # ---- Rejection-sampling path (M6) --------------------------------
+    temp = float(os.environ.get("SPEC_TEMP", "1.0"))
+    top_k = int(os.environ.get("SPEC_TOP_K", "50"))
+    seed = int(os.environ.get("SPEC_SEED", "0"))
+
+    base_rs_tokens, base_rs_t = dec.sample_baseline(
+        prompt, max_tokens, temperature=temp, top_k=top_k, seed=seed,
+    )
+    print(f"[sample-baseline] {len(base_rs_tokens)} tok in {base_rs_t:.3f}s "
+          f"-> {len(base_rs_tokens)/base_rs_t:.1f} tok/s  (T={temp} top_k={top_k})")
+
+    rs = dec.generate_rejection(
+        prompt, max_tokens, temperature=temp, top_k=top_k, seed=seed,
+    )
+    print(f"[spec-rejection] {len(rs.tokens)} tok in {rs.wall_time:.3f}s "
+          f"-> {len(rs.tokens)/rs.wall_time:.1f} tok/s")
+    print(f"  rounds={rs.rounds} proposed={rs.proposed} "
+          f"accepted={rs.accepted} bonus={rs.bonus} "
+          f"acceptance={rs.acceptance_rate*100:.1f}%")
+    print(f"  text: {rs.text!r}")
 
 
 if __name__ == "__main__":  # pragma: no cover
